@@ -13,6 +13,7 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::thread::{self};
 
@@ -316,6 +317,12 @@ impl<FS: Filesystem> Session<FS> {
 
         let mut threads = Vec::with_capacity(n_threads);
 
+        let session_dead = Arc::new(AtomicBool::new(false));
+        // Reader thread ids, so the reader that handles FUSE_DESTROY can kick
+        // the others out of blocking reads (FreeBSD never wakes them itself)
+        let readers: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(target_os = "freebsd")]
+        install_reader_kick_handler();
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = format!("fuser-{i}");
             let event_loop = SessionEventLoop {
@@ -327,6 +334,8 @@ impl<FS: Filesystem> Session<FS> {
                 negotiated,
                 kernel_capabilities,
                 kernel_abi: proto_version,
+                session_dead: session_dead.clone(),
+                readers: readers.clone(),
             };
             threads.push(
                 thread::Builder::new()
@@ -554,6 +563,39 @@ impl SessionUnmounter {
     }
 }
 
+/// A no-op SIGURG handler, installed WITHOUT SA_RESTART: a signal whose
+/// disposition is SIG_IGN or a handler with SA_RESTART does not interrupt
+/// a blocking read at all, and the kick relies on the read returning EINTR.
+/// The interrupted loop does the deciding; the handler itself does nothing.
+#[cfg(target_os = "freebsd")]
+extern "C" fn reader_kick_handler(_sig: libc::c_int) {}
+
+/// Installs the SIGURG handler the kick needs, once per Session::run
+/// (idempotent). FreeBSD only, and process-wide by necessity: a signal
+/// interrupts a blocking read only if the disposition at delivery time is a
+/// handler without SA_RESTART. A disposition installed by someone else is
+/// reported rather than silently discarded: its owner stops seeing SIGURG
+/// for the life of the process, and if it had SA_RESTART the kick could not
+/// work anyway.
+#[cfg(target_os = "freebsd")]
+fn install_reader_kick_handler() {
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction = reader_kick_handler as libc::sighandler_t;
+    let mut oldact: libc::sigaction = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut act.sa_mask);
+        act.sa_flags = 0; // no SA_RESTART: EINTR must surface
+        if libc::sigaction(libc::SIGURG, &act, &mut oldact) != 0 {
+            warn!("sigaction(SIGURG) failed; blocked readers may hang on forced unmount");
+            return;
+        }
+    }
+    let previous = oldact.sa_sigaction;
+    if previous != libc::SIG_DFL && previous != reader_kick_handler as libc::sighandler_t {
+        warn!("fuser: replaced an existing SIGURG handler for the session reader kick");
+    }
+}
+
 pub(crate) struct SessionEventLoop<FS: Filesystem> {
     /// Cache thread name for faster `debug!`.
     pub(crate) thread_name: String,
@@ -564,6 +606,11 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) negotiated: InitFlags,
     pub(crate) kernel_capabilities: InitFlags,
     pub(crate) kernel_abi: Option<Version>,
+    /// Set once FUSE_DESTROY has been handled: the readers that did not get
+    /// it exit on this flag, woken by the kick if they were blocking.
+    pub(crate) session_dead: Arc<AtomicBool>,
+    /// The reader thread ids, for the kick.
+    pub(crate) readers: Arc<Mutex<Vec<usize>>>,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
@@ -571,17 +618,47 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buf = FuseReadBuf::new();
+        // Register so the reader that handles FUSE_DESTROY can kick this
+        // thread out of a blocking read (see Channel::receive_session_aware)
+        self.readers
+            .lock()
+            .push(unsafe { libc::pthread_self() } as usize);
         let buf = buf.as_mut();
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive_retrying(buf) {
+            match self.ch.receive_session_aware(buf, &self.session_dead) {
                 Ok(size) => {
                     match RequestWithSender::new(self.ch.sender(), &buf[..size], self.negotiated) {
                         // Dispatch request
                         Some(req) => {
                             if let Ok(Operation::Destroy(_)) = req.request.operation() {
                                 req.reply::<ReplyEmpty>().ok();
+                                // The session is over for every reader, but
+                                // FreeBSD delivers FUSE_DESTROY to exactly one
+                                // of them and never wakes the rest, so mark the
+                                // death, then kick the others out of their
+                                // blocking reads: the SIGURG handler has no
+                                // SA_RESTART, so the read returns EINTR and
+                                // receive_session_aware turns that into an
+                                // exit. The flag is monotonic and set before
+                                // the kick, so one kick reaches everyone: a
+                                // reader that was mid-dispatch at the kick
+                                // sees the flag before blocking again.
+                                self.session_dead.store(true, Ordering::Release);
+                                #[cfg(target_os = "freebsd")]
+                                {
+                                    let tids: Vec<usize> = self.readers.lock().clone();
+                                    for tid in tids {
+                                        unsafe {
+                                            // ESRCH: the thread already exited
+                                            libc::pthread_kill(
+                                                tid as libc::pthread_t,
+                                                libc::SIGURG,
+                                            );
+                                        }
+                                    }
+                                }
                                 return Ok(());
                             } else {
                                 req.dispatch(self)

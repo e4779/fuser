@@ -2,6 +2,7 @@ use std::io;
 use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::errno::Errno;
 
@@ -41,6 +42,40 @@ impl Channel {
         loop {
             match self.receive(buffer) {
                 Ok(size) => return Ok(size),
+                Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Receives like `receive_retrying`, but exits once the session is dead
+    /// instead of retrying forever.
+    ///
+    /// The end of the session has to reach every reader, and on FreeBSD it
+    /// reaches only one: a forced unmount delivers FUSE_DESTROY to exactly
+    /// one blocked reader and never wakes the rest - no ENODEV, no EOF, and
+    /// with no FUSE_DEV_IOC_CLONE all readers share one fd, so the others
+    /// are already parked inside read(2) when it arrives. The reader that
+    /// handled FUSE_DESTROY therefore kicks the others with pthread_kill
+    /// (SIGURG, no-op handler without SA_RESTART), which surfaces here as
+    /// EINTR. The flag is the source of truth, and it is monotonic (set
+    /// once, before the kick): a reader that was not parked at the kick
+    /// sees it here before blocking again, so one kick suffices.
+    /// Steady-state cost: zero extra syscalls.
+    pub(crate) fn receive_session_aware(
+        &self,
+        buffer: &mut [u8],
+        session_dead: &AtomicBool,
+    ) -> nix::Result<usize> {
+        loop {
+            if session_dead.load(Ordering::Acquire) {
+                return Err(Errno::ENODEV);
+            }
+            match self.receive(buffer) {
+                Ok(size) => return Ok(size),
+                Err(Errno::EINTR) if session_dead.load(Ordering::Acquire) => {
+                    return Err(Errno::ENODEV);
+                }
                 Err(Errno::ENOENT | Errno::EINTR | Errno::EAGAIN) => continue,
                 Err(err) => return Err(err),
             }
